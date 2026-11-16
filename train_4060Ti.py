@@ -11,26 +11,121 @@ from tqdm import tqdm
 from einops import rearrange, repeat
 import platform
 
+import torch.utils.data as data
+from PIL import Image
+import numpy as np
 
 # 开启 TF32 (Ampere/Ada 架构核心加速)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-# 导入新版 autocast
-try:
-    from torch.amp import autocast
-except ImportError:
-    from torch.cuda.amp import autocast
-from torch.cuda.amp import GradScaler
+# # 导入新版 autocast
+# try:
+#     from torch.amp import autocast
+# except ImportError:
+#     from torch.cuda.amp import autocast
+# from torch.cuda.amp import GradScaler
+
+IMG_EXTENSIONS = [
+    '.jpg', '.JPG', '.jpeg', '.JPEG',
+    '.png', '.PNG', '.ppm', '.PPM', '.bmp', '.BMP',
+    '.npy', '.NPY', '.tif', '.TIF', '.tiff', '.TIFF'
+]
+
+def is_image_file(filename):
+    return any(filename.endswith(extension) for extension in IMG_EXTENSIONS)
+
+def make_dataset(dir):
+    if os.path.isfile(dir):
+        images = [i for i in np.genfromtxt(dir, dtype=np.str, encoding='utf-8')]
+    else:
+        images = []
+        assert os.path.isdir(dir), '%s is not a valid directory' % dir
+        for root, _, fnames in sorted(os.walk(dir)):
+            for fname in sorted(fnames):
+                if is_image_file(fname):
+                    path = os.path.join(root, fname)
+                    images.append(path)
+
+    return images
+
+def pil_loader(path):
+    return Image.open(path).convert('RGB')
+
+def array_loader(path):
+    # Load native arrays or TIFFs
+    if path.endswith('.npy') or path.endswith('.NPY'):
+        return np.load(path)
+    else:
+        # Fallback for TIFFs
+        from PIL import Image
+        return np.array(Image.open(path))
+
+class DenoisingDataset(data.Dataset):
+    def __init__(self, data_root, data_len=-1, image_size=[256, 256]):
+        self.data_root = data_root
+        self.image_size = image_size
+        self.max_log_val = 7.0
+        
+        # Point to the ground-truth folder
+        gt_dir = os.path.join(data_root, 'gt')
+        flist = make_dataset(gt_dir)
+        
+        if data_len > 0:
+            self.flist = flist[:int(data_len)]
+        else:
+            self.flist = flist
+
+    def __getitem__(self, index):
+        ret = {}
+        gt_path = self.flist[index]
+        
+        lq_path = (gt_path.replace('/gt/', '/lq/').replace('\\gt\\', '\\lq\\').replace('_gt.npy', '_lq.npy'))
+
+        # Load raw 1-channel arrays
+        gt_img = np.squeeze(array_loader(gt_path)).astype(np.float32)
+        lq_img = np.squeeze(array_loader(lq_path)).astype(np.float32)
+
+        gt_img = np.clip(gt_img, 0, None)
+        lq_img = np.clip(lq_img, 0, None)
+
+        gt_img = np.clip(np.log1p(gt_img) / self.max_log_val, 0, 1) * 2.0 - 1.0
+        lq_img = np.clip(np.log1p(lq_img) / self.max_log_val, 0, 1) * 2.0 - 1.0
+
+        # Convert to float tensor and add the 1-channel dimension: shape [1, H, W]
+        gt_tensor = torch.from_numpy(gt_img).float().unsqueeze(0)
+        lq_tensor = torch.from_numpy(lq_img).float().unsqueeze(0)
+
+        # Resize if images don't match the required U-Net dimensions
+        if gt_tensor.shape[1:] != tuple(self.image_size):
+            gt_tensor = torch.nn.functional.interpolate(
+                gt_tensor.unsqueeze(0), size=self.image_size, mode='bilinear', align_corners=False
+            ).squeeze(0)
+            lq_tensor = torch.nn.functional.interpolate(
+                lq_tensor.unsqueeze(0), size=self.image_size, mode='bilinear', align_corners=False
+            ).squeeze(0)
+
+        ret['gt_image'] = gt_tensor
+        ret['cond_image'] = lq_tensor
+        ret['path'] = gt_path.rsplit("/")[-1].rsplit("\\")[-1]
+        return lq_tensor, gt_tensor
+
+    def __len__(self):
+        return len(self.flist)
 
 # ==========================================
 # 1. 配置 (Ada Lovelace Config)
 # ==========================================
 class Config:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    img_size = 32
-    patch_size = 2
-    in_channels = 3
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    img_size = 256
+    patch_size = 8
+    in_channels = 1
     num_classes = 10
     
     # Modern ViT 架构参数
@@ -58,7 +153,7 @@ class Config:
     num_workers = 0 if platform.system() == 'Windows' else 4
     
     noise_scale = 1.0       
-    save_dir = "./jit_results_4060ti"
+    save_dir = "./jit_results_8"
     resume_path = None
 
 # ==========================================
@@ -207,33 +302,47 @@ class JiT(nn.Module):
 # ==========================================
 class Diffusion:
     def __init__(self, config):
-        self.noise_scale = config.noise_scale
         self.device = config.device
+        # noise_scale is removed because we use actual noisy X-ray images, not synthetic noise
+
     def sample_t(self, n):
-        return torch.sigmoid(torch.randn(n, device=self.device) * 1.2 - 0.6)
-    def q_sample(self, x0, t):
+        # Uniform sampling across [0, 1] is standard for Rectified Flow / paired matching
+        return torch.rand(n, device=self.device)
+
+    def q_sample(self, x_clean, x_noisy, t):
+        """
+        Forward process during training.
+        x_clean: Ground truth clean image (x1)
+        x_noisy: Input noisy speckle image (x0)
+        """
         t = t.view(-1, 1, 1, 1)
-        e = torch.randn_like(x0) * self.noise_scale
-        z = t * x0 + (1 - t) * e
-        return z, x0 - e, e 
-    
+        
+        # Interpolate between noisy (t=0) and clean (t=1)
+        z = t * x_clean + (1 - t) * x_noisy
+        
+        # Target velocity points exactly from noisy to clean
+        target_velocity = x_clean - x_noisy
+        
+        return z, target_velocity
+
     @torch.no_grad()
-    def p_sample_loop(self, model, n, labels, steps=50):
+    def p_sample_loop(self, model, noisy_imgs, steps=50):
         model.eval()
-        z = torch.randn(n, 3, Config.img_size, Config.img_size, device=self.device) * self.noise_scale
+        z = noisy_imgs.clone().to(self.device)
+        n = z.shape[0]
         dt = 1.0 / steps
-        null_labels = torch.full_like(labels, Config.num_classes)
+        
         for i in range(steps):
             t_curr = torch.tensor(i / steps, device=self.device).repeat(n)
-            z_in = torch.cat([z, z])
-            t_in = torch.cat([t_curr, t_curr])
-            y_in = torch.cat([labels, null_labels])
-            x_pred = model(z_in, t_in, y_in)
-            denom = (1 - t_in.view(-1, 1, 1, 1)).clamp(min=1e-3)
-            v_pred_both = (x_pred - z_in) / denom
-            v_cond, v_uncond = v_pred_both.chunk(2)
-            v = v_uncond + 3.0 * (v_cond - v_uncond)
-            z = z + v * dt
+            
+            # 1. Generate the dummy label tensor for the sampling batch
+            y_dummy = torch.zeros(n, dtype=torch.long, device=self.device)
+            
+            # 2. Pass z, t_curr, AND y_dummy into the model
+            v_pred = model(z, t_curr, y_dummy)
+            
+            z = z + v_pred * dt
+            
         model.train()
         return z.clamp(-1, 1)
 
@@ -250,31 +359,30 @@ def main():
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     
-    dataset = datasets.CIFAR10(root="data", train=True, download=True, transform=transform)
+    dataset = DenoisingDataset(data_root="/Users/nykolasrekasius/xray/xray_speckles/dataset_npy/train", image_size=[256, 256])
     
 
-    dataloader = DataLoader(
+    dataloader = torch.utils.data.DataLoader(
         dataset, 
-        batch_size=Config.batch_size, 
+        batch_size=8, 
         shuffle=True, 
-        num_workers=Config.num_workers, 
-        pin_memory=True,
-        persistent_workers=(Config.num_workers > 0)
+        num_workers=0, 
+        pin_memory=True
     )
             
     model = JiT(Config).to(Config.device)
     
-    # Windows需先安装triton
-    print("正在编译模型 (torch.compile)...")
-    try:
-        # mode='reduce-overhead' 会消耗更多显存，这里用默认模式或 max-autotune-no-cudagraphs
-        model = torch.compile(model) 
-    except Exception as e:
-        print(f"⚠️ 编译失败或不支持，将使用常规模式运行: {e}")
+    # # Windows需先安装triton
+    # print("正在编译模型 (torch.compile)...")
+    # try:
+    #     # mode='reduce-overhead' 会消耗更多显存，这里用默认模式或 max-autotune-no-cudagraphs
+    #     model = torch.compile(model) 
+    # except Exception as e:
+    #     print(f"⚠️ 编译失败或不支持，将使用常规模式运行: {e}")
     
     optimizer = optim.AdamW(model.parameters(), lr=Config.lr)
     diffusion = Diffusion(Config)
-    scaler = torch.amp.GradScaler('cuda')
+    # scaler = torch.amp.GradScaler('cuda')
     
     print("🚀 开始训练...")
     global_step = 0
@@ -285,28 +393,35 @@ def main():
         model.train()
         
         optimizer.zero_grad()
-        for step, (x, y) in enumerate(pbar):
-            x, y = x.to(Config.device, non_blocking=True), y.to(Config.device, non_blocking=True)
-            t = diffusion.sample_t(x.shape[0])
-            z, v_target, _ = diffusion.q_sample(x, t)
+        for step, (noisy_imgs, clean_imgs) in enumerate(pbar):
+            # 1. Move both noisy and clean paired images to the MPS device
+            noisy_imgs = noisy_imgs.to(Config.device, non_blocking=True)
+            clean_imgs = clean_imgs.to(Config.device, non_blocking=True)
             
-            if torch.rand(1) < 0.1:
-                y = torch.full_like(y, Config.num_classes)
+            # 2. Sample random timesteps
+            t = diffusion.sample_t(noisy_imgs.shape[0])
             
-            with autocast('cuda', dtype=torch.bfloat16):
-                x_pred = model(z, t, y)
-                denom = (1 - t.view(-1, 1, 1, 1)).clamp(min=1e-3)
-                v_pred = (x_pred - z) / denom
-                loss = F.mse_loss(v_pred, v_target)
-                loss = loss / Config.gradient_accumulation_steps
+            # 3. Call the updated q_sample with BOTH images (clean is x1, noisy is x0)
+            # Notice we only unpack two variables here now: z and v_target
+            z, v_target = diffusion.q_sample(clean_imgs, noisy_imgs, t)
+
+            # Forward
+
+            y_dummy = torch.zeros(z.shape[0], dtype=torch.long, device=Config.device)
+
+            # Remove 'y' (labels) and assign the output directly to v_pred
+            v_pred = model(z, t.squeeze(), y_dummy) 
+            
+            # Calculate loss against the target velocity (which is x_clean - x_noisy)
+            loss = torch.nn.functional.mse_loss(v_pred, v_target)
+            loss = loss / Config.gradient_accumulation_steps
             
             # Backward
-            scaler.scale(loss).backward()
+            loss.backward()
             
-            # 梯度累积
+            # 梯度累积 (Gradient Accumulation)
             if (step + 1) % Config.gradient_accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
             
@@ -319,10 +434,24 @@ def main():
         # 采样测试
         if epoch % 5 == 0:
             print("🎨 正在生成采样图...")
-            sample_labels = torch.tensor([7]*8 + [1]*8).to(Config.device) # 8个马，8个车
+            
+            # 1. Grab a real batch of noisy images and ground truth from the dataloader
+            test_noisy, test_clean = next(iter(dataloader))
+            test_noisy = test_noisy.to(Config.device)
+            test_clean = test_clean.to(Config.device)
+            
+            # 2. Denoise the real images
             with torch.no_grad():
-                imgs = diffusion.p_sample_loop(model, 16, sample_labels)
-            save_image((imgs + 1)/2, f"{Config.save_dir}/{epoch}.png", nrow=4)
+                imgs_denoised = diffusion.p_sample_loop(model, test_noisy)
+            
+            # 3. Concatenate noisy input, denoised output, and clean ground truth 
+            # This stacks them so row 1 is noisy, row 2 is denoised, row 3 is clean
+            comparison = torch.cat([test_noisy, imgs_denoised, test_clean], dim=0)
+            
+            # 4. Save the comparison grid and the model weights
+            # nrow=test_noisy.shape[0] ensures each category gets its own row
+            save_image((comparison + 1) / 2, f"{Config.save_dir}/{epoch}.png", nrow=test_noisy.shape[0])
+            
             torch.save(model.state_dict(), f"{Config.save_dir}/last.pth")
 
 if __name__ == "__main__":
